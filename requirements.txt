@@ -1,0 +1,13 @@
+pipecat-ai[websocket,cartesia,openai,silero,deepgram,runner,google,webrtc,daily]>=0.0.90
+pipecatcloud>=0.2.4
+aiortc
+pymongo
+pyngrok
+requests
+python-dotenv
+loguru
+fastapi
+uvicorn
+aiohttp
+httpx
+
