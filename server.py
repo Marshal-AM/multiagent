@@ -16,8 +16,11 @@ from typing import List, Dict, Optional
 from pathlib import Path
 from pydantic import BaseModel
 
-# Add parent directory to path for config_loader
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# Load environment variables FIRST before importing config_loader
+from dotenv import load_dotenv
+load_dotenv()
+
+# Import LOCAL config_loader
 from config_loader import (
     get_client_config, 
     get_mongodb_database_name,
@@ -25,6 +28,10 @@ from config_loader import (
     get_postprocessor_url,
     list_all_clients
 )
+
+# Import LOCAL auth module (in same directory)
+from auth.middleware import require_auth, check_client_ownership
+from auth.models import User
 
 try:
     from zoneinfo import ZoneInfo
@@ -34,14 +41,10 @@ except ImportError:
     except ImportError:
         ZoneInfo = None
 
-from dotenv import load_dotenv
 from pymongo import MongoClient
 from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
 
-# Load environment variables from .env file
-load_dotenv()
-
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pyngrok import ngrok
@@ -90,14 +93,44 @@ async def startup_event():
         except Exception as e:
             logger.warning(f"Failed to load guardrails for client {client_id}: {e}")
 
-# Add CORS middleware
+# Add CORS middleware (configurable via environment)
+CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Client-ID", "X-Request-ID"],  # Expose custom headers
+    max_age=600,  # Cache preflight requests for 10 minutes
 )
+
+# Tenant Context Middleware
+@app.middleware("http")
+async def tenant_context_middleware(request: Request, call_next):
+    """
+    Middleware to extract and store tenant/client context in request state.
+    Logs which tenant is accessing which resource for monitoring and debugging.
+    """
+    # Extract client_id from query params or headers
+    client_id = request.query_params.get("client_id") or request.headers.get("X-Client-ID")
+    
+    # Store in request state for easy access throughout request lifecycle
+    request.state.client_id = client_id
+    request.state.has_client_context = bool(client_id)
+    
+    # Log tenant context (optional - can be disabled in production)
+    if client_id:
+        logger.debug(f"[Tenant: {client_id}] {request.method} {request.url.path}")
+    
+    # Process request
+    response = await call_next(request)
+    
+    # Add client_id to response headers for tracking
+    if client_id:
+        response.headers["X-Client-ID"] = client_id
+    
+    return response
 
 # Configuration
 DAILY_API_KEY = os.getenv("DAILY_API_KEY", "")
@@ -115,13 +148,48 @@ if not GOOGLE_VERTEX_CREDENTIALS:
 if not MONGODB_URI:
     logger.warning("MONGODB_URI not set - user lookup functionality will be disabled")
 
+# Initialize MongoDB client with connection pooling
+# Single client instance shared across all requests and all client databases
+mongodb_client = None
+if MONGODB_URI:
+    try:
+        mongodb_client = MongoClient(
+            MONGODB_URI,
+            maxPoolSize=50,  # Maximum 50 connections in pool
+            minPoolSize=10,  # Minimum 10 connections always ready
+            maxIdleTimeMS=45000,  # Close idle connections after 45s
+            serverSelectionTimeoutMS=5000,  # Timeout for server selection
+            connectTimeoutMS=10000,  # Timeout for initial connection
+            socketTimeoutMS=45000,  # Timeout for socket operations
+            retryWrites=True,  # Retry writes on network errors
+            retryReads=True,  # Retry reads on network errors
+        )
+        # Test connection
+        mongodb_client.admin.command('ping')
+        logger.info("✅ MongoDB connection pool initialized successfully")
+    except (ConnectionFailure, ServerSelectionTimeoutError) as e:
+        logger.error(f"❌ Failed to connect to MongoDB: {e}")
+        mongodb_client = None
+    except Exception as e:
+        logger.error(f"❌ Error connecting to MongoDB: {e}")
+        mongodb_client = None
+
 
 def get_client_id_from_request(request: Request) -> str:
-    """Extract client_id from query params or headers"""
-    client_id = request.query_params.get("client_id") or request.headers.get("X-Client-ID")
-    if not client_id:
-        raise HTTPException(status_code=400, detail="client_id is required (query param or X-Client-ID header)")
-    return client_id
+    """
+    Extract MongoDB ObjectId from request state (set by tenant context middleware).
+    Falls back to extracting from query params or headers if not in state.
+    Now expects 'id' instead of 'client_id' - this is the MongoDB ObjectId.
+    """
+    # Try to get from request state (set by tenant context middleware)
+    if hasattr(request.state, 'client_id') and request.state.client_id:
+        return request.state.client_id
+
+    # Fallback: extract from query params or headers (now looking for 'id' parameter)
+    id = request.query_params.get("id") or request.headers.get("X-Client-ID")
+    if not id:
+        raise HTTPException(status_code=400, detail="id is required (query param 'id' or X-Client-ID header with MongoDB ObjectId)")
+    return id
 
 
 def start_ngrok_tunnel(port=8000):
@@ -163,6 +231,104 @@ def cleanup_ngrok():
             logger.error(f"Error closing ngrok tunnel: {e}")
 
 
+def fix_malformed_json(creds: str) -> Optional[dict]:
+    """
+    Attempt to fix malformed JSON where quotes are missing.
+    Handles cases like: {type:service_account,project_id:value}
+    Converts to: {"type":"service_account","project_id":"value"}
+    """
+    import re
+    
+    # Check if it looks like malformed JSON (starts with { but missing quotes)
+    if not creds.startswith('{') or '"' in creds[:100]:
+        return None
+    
+    try:
+        # Use regex-based approach - simpler and more reliable
+        def quote_pair(match):
+            key = match.group(1)
+            value = match.group(2).strip()
+            
+            # Already has quotes - keep as-is
+            if value.startswith('"') and value.endswith('"'):
+                return f'"{key}":{value}'
+            
+            # Don't quote booleans or null
+            if value.lower() in ['true', 'false', 'null']:
+                return f'"{key}":{value}'
+            
+            # Don't quote numbers
+            try:
+                float(value)
+                return f'"{key}":{value}'
+            except ValueError:
+                pass
+            
+            # Don't quote nested objects/arrays
+            if value.startswith('{') or value.startswith('['):
+                return f'"{key}":{value}'
+            
+            # It's a string - quote and escape special characters
+            # Escape backslashes first, then quotes
+            value_escaped = value.replace('\\', '\\\\').replace('"', '\\"')
+            return f'"{key}":"{value_escaped}"'
+        
+        # Match key:value patterns
+        # Pattern: (\w+): captures the key, ([^,}]+) captures the value until comma or }
+        pattern = r'(\w+):([^,}]+)'
+        fixed = re.sub(pattern, quote_pair, creds)
+        
+        # Try to parse
+        creds_dict = json.loads(fixed)
+        logger.info("Successfully fixed malformed JSON (missing quotes)")
+        return creds_dict
+        
+    except (json.JSONDecodeError, Exception) as e:
+        # Fallback: try regex-based approach
+        try:
+            # Simple regex: find all key:value and quote them
+            def quote_pair(match):
+                key = match.group(1)
+                value = match.group(2).strip()
+                
+                # Already has quotes - keep as-is
+                if value.startswith('"') and value.endswith('"'):
+                    return f'"{key}":{value}'
+                
+                # Don't quote booleans or null
+                if value.lower() in ['true', 'false', 'null']:
+                    return f'"{key}":{value}'
+                
+                # Don't quote numbers
+                try:
+                    float(value)
+                    return f'"{key}":{value}'
+                except ValueError:
+                    pass
+                
+                # Don't quote nested objects/arrays
+                if value.startswith('{') or value.startswith('['):
+                    return f'"{key}":{value}'
+                
+                # It's a string - quote and escape special characters
+                # Escape backslashes first, then quotes
+                value_escaped = value.replace('\\', '\\\\').replace('"', '\\"')
+                return f'"{key}":"{value_escaped}"'
+            
+            # Match key:value patterns
+            # Pattern: (\w+): captures the key, ([^,}]+) captures the value until comma or }
+            pattern = r'(\w+):([^,}]+)'
+            fixed = re.sub(pattern, quote_pair, creds)
+            
+            # Try to parse
+            creds_dict = json.loads(fixed)
+            logger.info("Successfully fixed malformed JSON using regex fallback")
+            return creds_dict
+        except Exception as e2:
+            logger.debug(f"Failed to fix malformed JSON: {e}, fallback also failed: {e2}")
+            return None
+
+
 def fix_credentials():
     """Fix GOOGLE_VERTEX_CREDENTIALS so Pipecat can parse it."""
     creds = GOOGLE_VERTEX_CREDENTIALS
@@ -172,50 +338,150 @@ def fix_credentials():
     
     creds = creds.strip()
     
+    # Log what we're trying to parse (for debugging)
+    logger.debug(f"GOOGLE_VERTEX_CREDENTIALS value type: starts with '{{'={creds.startswith('{')}, starts with './'={creds.startswith('./')}, is file path={os.path.isfile(creds) if not creds.startswith('{') else False}")
+    
+    # Remove surrounding quotes if present
     if (creds.startswith('"') and creds.endswith('"')) or (creds.startswith("'") and creds.endswith("'")):
         creds = creds[1:-1]
     
+    # Try to parse as JSON first (only if it looks like JSON)
     if creds.startswith('{') or creds.startswith('['):
         try:
+            # Handle escaped newlines in the JSON string
+            # Replace literal \n with actual newlines for JSON parsing
             creds_dict = json.loads(creds)
             if "private_key" in creds_dict:
+                # Fix newlines in private key
                 creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
+            logger.debug("Successfully parsed credentials as JSON")
             return json.dumps(creds_dict)
-        except json.JSONDecodeError:
-            pass
+        except json.JSONDecodeError as e:
+            # If JSON parsing fails, try unescaping common issues
+            try:
+                # Try replacing escaped quotes and newlines
+                creds_unescaped = creds.replace('\\"', '"').replace("\\'", "'")
+                creds_dict = json.loads(creds_unescaped)
+                if "private_key" in creds_dict:
+                    creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
+                logger.debug("Successfully parsed credentials as JSON after unescaping")
+                return json.dumps(creds_dict)
+            except json.JSONDecodeError:
+                # Try fixing malformed JSON (missing quotes)
+                creds_dict = fix_malformed_json(creds)
+                if creds_dict:
+                    if "private_key" in creds_dict:
+                        creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
+                    return json.dumps(creds_dict)
+                logger.warning(f"Failed to parse credentials as JSON: {e}")
+                # Don't pass yet - might be a file path
     
+    # Try to resolve as file path
     file_path = None
     script_dir = os.path.dirname(os.path.abspath(__file__))
+    current_dir = os.getcwd()
     
+    # List of potential paths to check
+    potential_paths = []
+    
+    # If absolute path
     if os.path.isabs(creds):
-        if os.path.isfile(creds):
-            file_path = creds
-    elif os.path.isfile(creds):
-        file_path = os.path.abspath(creds)
+        potential_paths.append(creds)
     else:
-        potential_path = os.path.join(script_dir, creds)
-        if os.path.isfile(potential_path):
-            file_path = potential_path
+        # Relative paths to check
+        potential_paths.extend([
+            creds,  # Current working directory
+            os.path.join(script_dir, creds),  # Same directory as script
+            os.path.join(current_dir, creds),  # Current working directory (explicit)
+        ])
+        
+        # If it starts with ./, also try without the ./
+        if creds.startswith('./'):
+            creds_no_dot = creds[2:]
+            potential_paths.extend([
+                creds_no_dot,
+                os.path.join(script_dir, creds_no_dot),
+                os.path.join(current_dir, creds_no_dot),
+            ])
+        
+        # If it ends with .json, also try in parent directories
+        if creds.endswith('.json'):
+            parent_dir = os.path.dirname(script_dir)
+            potential_paths.extend([
+                os.path.join(parent_dir, creds),
+                os.path.join(parent_dir, creds[2:] if creds.startswith('./') else creds),
+            ])
     
-    if not file_path and creds.endswith('.json'):
-        potential_path = os.path.join(script_dir, creds)
-        if os.path.isfile(potential_path):
-            file_path = potential_path
+    # Check each potential path
+    for path in potential_paths:
+        if os.path.isfile(path):
+            file_path = os.path.abspath(path)
+            logger.info(f"Found credentials file at: {file_path}")
+            break
+    
+    if not file_path:
+        logger.debug(f"Checked paths: {potential_paths[:5]}... (showing first 5)")
     
     if file_path and os.path.isfile(file_path):
         try:
             with open(file_path, 'r') as f:
                 creds_dict = json.load(f)
+            logger.info(f"Successfully loaded credentials from file: {file_path}")
         except (FileNotFoundError, json.JSONDecodeError) as e:
             raise ValueError(f"Failed to read credentials from file '{file_path}': {e}") from e
     else:
+        # File not found - try parsing as JSON one more time
+        # (in case it's malformed JSON that needs fixing)
+        creds_dict = None
+        
+        # Strategy 1: Direct JSON parse
         try:
             creds_dict = json.loads(creds)
-        except json.JSONDecodeError as e:
-            raise ValueError(f"GOOGLE_VERTEX_CREDENTIALS is not valid JSON and not a valid file path. Value: '{creds[:50]}...' Error: {e}") from e
+            logger.debug("Successfully parsed credentials as JSON (fallback)")
+        except json.JSONDecodeError:
+            pass
+        
+        # Strategy 2: Try unescaping common issues
+        if creds_dict is None:
+            try:
+                # Replace escaped quotes and newlines
+                creds_unescaped = creds.replace('\\"', '"').replace("\\'", "'")
+                creds_dict = json.loads(creds_unescaped)
+                logger.debug("Successfully parsed credentials after unescaping (fallback)")
+            except json.JSONDecodeError:
+                pass
+        
+        # Strategy 3: Try reading as raw string and parsing
+        if creds_dict is None:
+            try:
+                # Handle case where newlines are literal \n strings
+                creds_fixed = creds.replace('\\n', '\n').replace('\\"', '"')
+                creds_dict = json.loads(creds_fixed)
+                logger.debug("Successfully parsed credentials after fixing newlines (fallback)")
+            except json.JSONDecodeError:
+                pass
+        
+        if creds_dict is None:
+            # Log the actual value for debugging (truncated)
+            creds_preview = creds[:100].replace('\n', '\\n').replace('\r', '\\r')
+            error_msg = (
+                f"GOOGLE_VERTEX_CREDENTIALS is not valid JSON and not a valid file path.\n"
+                f"Value preview: '{creds_preview}...'\n"
+                f"Script directory: {script_dir}\n"
+                f"Current directory: {current_dir}\n"
+                f"Checked paths: {potential_paths[:3]}...\n"
+                f"If using Vast AI, check your environment variables in the dashboard.\n"
+                f"The .env file value may be overridden by Vast AI's environment settings."
+            )
+            logger.error(error_msg)
+            raise ValueError(error_msg)
     
     if "private_key" in creds_dict:
-        creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
+        # Fix newlines in private key (handle both \\n and \n)
+        private_key = creds_dict["private_key"]
+        # Replace escaped newlines with actual newlines
+        private_key = private_key.replace("\\n", "\n")
+        creds_dict["private_key"] = private_key
 
     return json.dumps(creds_dict)
 
@@ -347,23 +613,31 @@ def get_current_datetime_info():
 
 
 def load_system_prompt(client_id: str) -> str:
-    """Load system prompt from MongoDB for a specific client."""
+    """Load system prompt from MongoDB for a specific client.
+    Always includes the default system prompt from system_prompt.py along with client-specific prompt.
+    """
+    # Always load the default system prompt first
+    from system_prompt import SYSTEM_PROMPT
+    default_prompt = SYSTEM_PROMPT.strip()
+    
     try:
         config = get_client_config(client_id)
-        system_prompt = config.get('agent', {}).get('system_prompt', '')
+        client_system_prompt = config.get('agent', {}).get('system_prompt', '').strip()
         
-        if system_prompt:
-            return system_prompt
-        
-        # Fallback to default system prompt if not set
-        logger.warning(f"No system prompt found for client {client_id}, using default")
-        from system_prompt import SYSTEM_PROMPT
-        return SYSTEM_PROMPT
+        if client_system_prompt:
+            # Combine default prompt with client-specific prompt
+            # Default prompt comes first, then client-specific prompt
+            combined_prompt = f"{default_prompt}\n\n{client_system_prompt}"
+            logger.debug(f"Loaded combined system prompt for client {client_id} (default + client-specific)")
+            return combined_prompt
+        else:
+            # No client-specific prompt, use only default
+            logger.info(f"No client-specific system prompt found for client {client_id}, using default only")
+            return default_prompt
             
     except Exception as e:
-        logger.error(f"Error loading system prompt for client {client_id}: {e}, using default")
-        from system_prompt import SYSTEM_PROMPT
-        return SYSTEM_PROMPT
+        logger.error(f"Error loading system prompt for client {client_id}: {e}, using default only")
+        return default_prompt
 
 
 async def fetch_detailed_information(client_id: str, params: FunctionCallParams):
@@ -545,19 +819,11 @@ def normalize_phone_number(phone_number: str) -> str:
 
 
 def get_mongodb_client():
-    """Get MongoDB client connection"""
-    if not MONGODB_URI:
-        return None
-    try:
-        client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
-        client.admin.command('ping')
-        return client
-    except (ConnectionFailure, ServerSelectionTimeoutError) as e:
-        logger.error(f"Failed to connect to MongoDB: {e}")
-        return None
-    except Exception as e:
-        logger.error(f"Error connecting to MongoDB: {e}")
-        return None
+    """
+    Get MongoDB client (shared connection pool)
+    Returns the global mongodb_client instance
+    """
+    return mongodb_client
 
 
 def load_guardrails_from_mongodb(client_id: str):
@@ -585,7 +851,6 @@ def load_guardrails_from_mongodb(client_id: str):
             guardrails_storage[client_id].extend(stored_guardrails)
         
         logger.info(f"Loaded {len(stored_guardrails)} guardrail(s) from MongoDB for client {client_id}")
-        client.close()
         
     except Exception as e:
         logger.error(f"Error loading guardrails from MongoDB for client {client_id}: {e}", exc_info=True)
@@ -617,7 +882,6 @@ def save_guardrails_to_mongodb(client_id: str):
             else:
                 logger.info(f"No guardrails to save for client {client_id} (storage is empty)")
         
-        client.close()
         return True
         
     except Exception as e:
@@ -671,7 +935,6 @@ def get_user_data(client_id: str, phone_number: str = None, email: str = None):
         if not user:
             lookup_info = f"phone: {phone_number}" if phone_number else f"email: {email}"
             logger.info(f"User not found in database for {lookup_info} (client: {client_id})")
-            client.close()
             return None
         
         user_id = user.get("_id")
@@ -714,7 +977,6 @@ def get_user_data(client_id: str, phone_number: str = None, email: str = None):
             } if analytics else {}
         }
         
-        client.close()
         lookup_method = f"phone: {user_phone}" if user_phone else f"email: {user_data['user_profile']['email']}"
         logger.info(f"Found existing user: {user_data['user_profile']['name']} ({lookup_method}, client: {client_id})")
         return user_data
@@ -881,11 +1143,42 @@ async def run_bot(client_id: str, room_url: str, token: str):
 
 """
         
+        # Get languages from agent config
+        languages = agent_config.get('languages', [])
+        languages_context = ""
+        if languages:
+            languages_list = ", ".join(languages)
+            languages_context = f"""
+
+## SUPPORTED LANGUAGES
+
+**IMPORTANT: You MUST support and respond in the following languages: {languages_list}**
+
+- You MUST be able to detect and respond in any of these languages: {languages_list}
+- When a user speaks in any of these languages, IMMEDIATELY switch to that language without asking
+- You can switch between these languages seamlessly as the user switches
+- If a language is not in this list, default to English (or the first language in the list)
+
+"""
+        else:
+            # Default to common Indian languages if not specified
+            languages_context = """
+
+## SUPPORTED LANGUAGES
+
+**IMPORTANT: You MUST support and respond in the following languages: Tamil, English, Malayalam, Kannada, Telugu, Hindi**
+
+- You MUST be able to detect and respond in any of these languages: Tamil, English, Malayalam, Kannada, Telugu, Hindi
+- When a user speaks in any of these languages, IMMEDIATELY switch to that language without asking
+- You can switch between these languages seamlessly as the user switches
+
+"""
+        
         guardrails_context = format_guardrails_for_prompt(client_id)
         
         # Load client-specific system prompt
         system_prompt = load_system_prompt(client_id)
-        system_instruction = system_prompt + datetime_context + guardrails_context
+        system_instruction = system_prompt + datetime_context + languages_context + guardrails_context
 
         # Build tools based on client config
         tools_list = []
@@ -1089,7 +1382,7 @@ async def run_bot(client_id: str, room_url: str, token: str):
         
         logger.info("Pipeline runner completed")
     except Exception as e:
-        logger.error(f"Error running bot for client {client_id}: {e}", exc_info=True)
+        logger.error("Error running bot for client {}: {}", client_id, str(e), exc_info=True)
         raise
     finally:
         if transport:
@@ -1102,28 +1395,35 @@ async def run_bot(client_id: str, room_url: str, token: str):
 
 @app.post("/start")
 async def start_session(request: Request):
-    """Create a Daily room, start the bot, and return connection details"""
+    """
+    Create a Daily room, start the bot, and return connection details.
+    Now expects MongoDB ObjectId as 'id' parameter instead of 'client_id'.
+    """
     try:
-        client_id = get_client_id_from_request(request)
+        id = get_client_id_from_request(request)
         
-        # Validate client exists
+        # Validate client exists (using ObjectId)
         try:
-            get_client_config(client_id)
+            config = get_client_config(id)
+            client_id = config.get('client_id')  # Get the client_id string from config
         except FileNotFoundError:
-            raise HTTPException(status_code=404, detail=f"Client '{client_id}' not found")
+            raise HTTPException(status_code=404, detail=f"Client with id '{id}' not found")
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
         
-        logger.info(f"Creating Daily room and starting bot for client: {client_id}...")
+        logger.info(f"Creating Daily room and starting bot for client: {id} ({client_id})...")
         
         room_url, token = await create_daily_room()
         logger.info(f"Created room: {room_url}")
 
-        asyncio.create_task(run_bot(client_id, room_url, token))
+        asyncio.create_task(run_bot(id, room_url, token))
 
         return JSONResponse(
             content={
                 "room_url": room_url,
                 "token": token,
-                "client_id": client_id
+                "id": id,
+                "client_id": client_id  # Include both for backwards compatibility
             }
         )
 
@@ -1148,10 +1448,21 @@ class GuardrailsRequest(BaseModel):
 
 
 @app.post("/upload-guardrails")
-async def upload_guardrails(request: Request, guardrails_request: GuardrailsRequest):
-    """Upload question-answer pairs (guardrails/instructions) for a specific client"""
+async def upload_guardrails(
+    request: Request,
+    guardrails_request: GuardrailsRequest,
+    user: User = Depends(require_auth)
+):
+    """
+    Upload question-answer pairs (guardrails/instructions) for a specific client
+    
+    **Requires:** JWT authentication + ownership of the client
+    """
     try:
         client_id = get_client_id_from_request(request)
+        
+        # Verify user owns this client
+        check_client_ownership(client_id, user)
         
         if not guardrails_request.guardrails:
             raise HTTPException(status_code=400, detail="At least one guardrail (question-answer pair) is required")
