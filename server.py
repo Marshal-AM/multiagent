@@ -86,12 +86,12 @@ app = FastAPI(title="Multi-Tenant Agent Server", version="2.0.0")
 async def startup_event():
     """Load guardrails from MongoDB when the application starts"""
     logger.info("Application starting up - loading guardrails from MongoDB for all clients...")
-    clients = list_all_clients()
-    for client_id in clients:
+    clients = list_all_clients()  # Now returns ObjectIds as strings
+    for id in clients:
         try:
-            load_guardrails_from_mongodb(client_id)
+            load_guardrails_from_mongodb(id)
         except Exception as e:
-            logger.warning(f"Failed to load guardrails for client {client_id}: {e}")
+            logger.warning(f"Failed to load guardrails for client {id}: {e}")
 
 # Add CORS middleware (configurable via environment)
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
@@ -537,10 +537,13 @@ def get_guardrail_phone_numbers(client_id: str) -> List[str]:
         return list(phone_numbers)
 
 
-def format_guardrails_for_prompt(client_id: str) -> str:
-    """Format stored guardrails for a specific client for inclusion in system prompt."""
+def format_guardrails_for_prompt(id: str) -> str:
+    """
+    Format stored guardrails for a specific client for inclusion in system prompt.
+    Now uses MongoDB ObjectId instead of client_id string.
+    """
     with guardrails_lock:
-        guardrails = guardrails_storage.get(client_id, [])
+        guardrails = guardrails_storage.get(id, [])
         
         if not guardrails:
             return ""
@@ -612,31 +615,33 @@ def get_current_datetime_info():
         }
 
 
-def load_system_prompt(client_id: str) -> str:
-    """Load system prompt from MongoDB for a specific client.
+def load_system_prompt(id: str) -> str:
+    """
+    Load system prompt from MongoDB for a specific client.
     Always includes the default system prompt from system_prompt.py along with client-specific prompt.
+    Now uses MongoDB ObjectId instead of client_id string.
     """
     # Always load the default system prompt first
     from system_prompt import SYSTEM_PROMPT
     default_prompt = SYSTEM_PROMPT.strip()
-    
+
     try:
-        config = get_client_config(client_id)
+        config = get_client_config(id)
         client_system_prompt = config.get('agent', {}).get('system_prompt', '').strip()
-        
+
         if client_system_prompt:
             # Combine default prompt with client-specific prompt
             # Default prompt comes first, then client-specific prompt
             combined_prompt = f"{default_prompt}\n\n{client_system_prompt}"
-            logger.debug(f"Loaded combined system prompt for client {client_id} (default + client-specific)")
+            logger.debug(f"Loaded combined system prompt for client {id} (default + client-specific)")
             return combined_prompt
         else:
             # No client-specific prompt, use only default
-            logger.info(f"No client-specific system prompt found for client {client_id}, using default only")
+            logger.info(f"No client-specific system prompt found for client {id}, using default only")
             return default_prompt
             
     except Exception as e:
-        logger.error(f"Error loading system prompt for client {client_id}: {e}, using default only")
+        logger.error(f"Error loading system prompt for client {id}: {e}, using default only")
         return default_prompt
 
 
@@ -826,61 +831,67 @@ def get_mongodb_client():
     return mongodb_client
 
 
-def load_guardrails_from_mongodb(client_id: str):
-    """Load guardrails from MongoDB into memory storage for a specific client"""
+def load_guardrails_from_mongodb(id: str):
+    """
+    Load guardrails from MongoDB into memory storage for a specific client.
+    Now uses MongoDB ObjectId instead of client_id string.
+    """
     if not MONGODB_URI:
-        logger.warning(f"MongoDB URI not configured, guardrails will not persist for client {client_id}")
+        logger.warning(f"MongoDB URI not configured, guardrails will not persist for client {id}")
         return
-    
+
     try:
         client = get_mongodb_client()
         if not client:
-            logger.warning(f"Could not connect to MongoDB, guardrails will not persist for client {client_id}")
+            logger.warning(f"Could not connect to MongoDB, guardrails will not persist for client {id}")
             return
-        
-        db_name = get_mongodb_database_name(client_id)
+
+        db_name = get_mongodb_database_name(id)
         db = client[db_name]
         guardrails_collection = db["guardrails"]
-        
+
         stored_guardrails = list(guardrails_collection.find({}, {"_id": 0, "question": 1, "answer": 1}))
-        
+
         with guardrails_lock:
-            if client_id not in guardrails_storage:
-                guardrails_storage[client_id] = []
-            guardrails_storage[client_id].clear()
-            guardrails_storage[client_id].extend(stored_guardrails)
-        
-        logger.info(f"Loaded {len(stored_guardrails)} guardrail(s) from MongoDB for client {client_id}")
-        
+            if id not in guardrails_storage:
+                guardrails_storage[id] = []
+            guardrails_storage[id].clear()
+            guardrails_storage[id].extend(stored_guardrails)
+
+        logger.info(f"Loaded {len(stored_guardrails)} guardrail(s) from MongoDB for client {id}")
+
     except Exception as e:
-        logger.error(f"Error loading guardrails from MongoDB for client {client_id}: {e}", exc_info=True)
+        logger.error(f"Error loading guardrails from MongoDB for client {id}: {e}", exc_info=True)
 
 
-def save_guardrails_to_mongodb(client_id: str):
-    """Save current guardrails from memory to MongoDB for a specific client"""
+def save_guardrails_to_mongodb(id: str):
+    """
+    Save current guardrails from memory to MongoDB for a specific client.
+    Now uses MongoDB ObjectId instead of client_id string.
+    """
     if not MONGODB_URI:
-        logger.warning(f"MongoDB URI not configured, guardrails will not persist for client {client_id}")
+        logger.warning(f"MongoDB URI not configured, guardrails will not persist for client {id}")
         return False
-    
+
     try:
         client = get_mongodb_client()
         if not client:
-            logger.warning(f"Could not connect to MongoDB, guardrails will not persist for client {client_id}")
+            logger.warning(f"Could not connect to MongoDB, guardrails will not persist for client {id}")
             return False
-        
-        db_name = get_mongodb_database_name(client_id)
+
+        db_name = get_mongodb_database_name(id)
         db = client[db_name]
         guardrails_collection = db["guardrails"]
-        
+
         with guardrails_lock:
-            guardrails = guardrails_storage.get(client_id, [])
+            guardrails = guardrails_storage.get(id, [])
             guardrails_collection.delete_many({})
-            
+
             if guardrails:
                 guardrails_collection.insert_many(guardrails)
-                logger.info(f"Saved {len(guardrails)} guardrail(s) to MongoDB for client {client_id}")
+                logger.info(f"Saved {len(guardrails)} guardrail(s) to MongoDB for client {id}")
             else:
-                logger.info(f"No guardrails to save for client {client_id} (storage is empty)")
+                logger.info(f"No guardrails to save for client {id} (storage is empty)")
         
         return True
         
@@ -1085,14 +1096,17 @@ async def create_daily_room() -> tuple[str, str]:
     return room_url, token
 
 
-async def run_bot(client_id: str, room_url: str, token: str):
-    """Run the voice bot in the Daily room for a specific client"""
+async def run_bot(id: str, room_url: str, token: str):
+    """
+    Run the voice bot in the Daily room for a specific client.
+    Now uses MongoDB ObjectId instead of client_id string.
+    """
     transport = None
     try:
-        logger.info(f"Starting bot for room: {room_url} (client: {client_id})")
+        logger.info(f"Starting bot for room: {room_url} (client id: {id})")
         
         # Load client configuration
-        config = get_client_config(client_id)
+        config = get_client_config(id)
         agent_config = config.get('agent', {})
         llm_config = agent_config.get('llm_config', {})
         
@@ -1120,10 +1134,10 @@ async def run_bot(client_id: str, room_url: str, token: str):
         
         model_path = f"projects/{project_id}/locations/{location}/publishers/google/models/{model_id}"
         
-        logger.info(f"Using Vertex AI model: {model_path} (client: {client_id})")
+        logger.info(f"Using Vertex AI model: {model_path} (client: {id})")
 
         temperature = float(llm_config.get('temperature', os.getenv("LLM_TEMPERATURE", "0.1")))
-        logger.info(f"Using LLM temperature: {temperature} (client: {client_id})")
+        logger.info(f"Using LLM temperature: {temperature} (client: {id})")
 
         datetime_info = get_current_datetime_info()
         logger.info(f"Current date/time context: {datetime_info['current_date']} {datetime_info['current_time']} ({datetime_info['timezone']})")
@@ -1174,10 +1188,10 @@ async def run_bot(client_id: str, room_url: str, token: str):
 
 """
         
-        guardrails_context = format_guardrails_for_prompt(client_id)
+        guardrails_context = format_guardrails_for_prompt(id)
         
         # Load client-specific system prompt
-        system_prompt = load_system_prompt(client_id)
+        system_prompt = load_system_prompt(id)
         system_instruction = system_prompt + datetime_context + languages_context + guardrails_context
 
         # Build tools based on client config
