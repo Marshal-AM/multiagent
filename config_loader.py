@@ -233,21 +233,22 @@ def get_openai_api_key(client_id: str) -> Optional[str]:
 
 def list_all_clients() -> list:
     """
-    List all available client IDs from MongoDB.
-    
+    List all available client ObjectIds from MongoDB.
+
     Returns:
-        List of client IDs
+        List of MongoDB ObjectIds as strings
     """
     mongo_client = get_mongodb_client()
     if not mongo_client:
         return []
-    
+
     try:
         admin_db = mongo_client[ADMIN_DB_NAME]
         clients_collection = admin_db["client_configs"]
-        
-        clients = clients_collection.find({}, {"client_id": 1})
-        client_ids = [client["client_id"] for client in clients if "client_id" in client]
+
+        clients = clients_collection.find({}, {"_id": 1})
+        # Return ObjectIds as strings
+        client_ids = [str(client["_id"]) for client in clients if "_id" in client]
         return sorted(client_ids)
     except Exception as e:
         logger.error(f"Error listing clients from MongoDB: {e}")
