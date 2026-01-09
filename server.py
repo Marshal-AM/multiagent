@@ -632,16 +632,18 @@ def load_system_prompt(id: str) -> str:
         if client_system_prompt:
             # Combine default prompt with client-specific prompt
             # Default prompt comes first, then client-specific prompt
-            combined_prompt = f"{default_prompt}\n\n{client_system_prompt}"
-            logger.debug(f"Loaded combined system prompt for client {id} (default + client-specific)")
+            combined_prompt = f"{default_prompt}\n\n## CLIENT-SPECIFIC INSTRUCTIONS\n\n{client_system_prompt}"
+            logger.info(f"✅ Loaded combined system prompt for client {id}")
+            logger.info(f"  - Default prompt: {len(default_prompt)} chars")
+            logger.info(f"  - Client prompt: {len(client_system_prompt)} chars")
             return combined_prompt
         else:
             # No client-specific prompt, use only default
-            logger.info(f"No client-specific system prompt found for client {id}, using default only")
+            logger.info(f"ℹ️ No client-specific system prompt found for client {id}, using default only")
             return default_prompt
             
     except Exception as e:
-        logger.error(f"Error loading system prompt for client {id}: {e}, using default only")
+        logger.error(f"❌ Error loading system prompt for client {id}: {e}, using default only")
         return default_prompt
 
 
@@ -691,7 +693,10 @@ async def fetch_detailed_information(client_id: str, params: FunctionCallParams)
         preprocessor_url = get_preprocessor_url(client_id)
         query_url = f"{preprocessor_url}/query"
         
-        logger.info(f"Calling preprocessor API ({client_id}) with query: {query}, payload: {list(request_payload.keys())}")
+        logger.info(f"📡 Calling preprocessor API for client: {client_id}")
+        logger.info(f"  - Preprocessor URL: {preprocessor_url}")
+        logger.info(f"  - Query: {query}")
+        logger.info(f"  - Payload keys: {list(request_payload.keys())}")
         
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(query_url, json=request_payload)
@@ -1192,18 +1197,27 @@ async def run_bot(id: str, room_url: str, token: str):
         
         # Load client-specific system prompt
         system_prompt = load_system_prompt(id)
+        logger.info(f"📝 System Prompt Loaded for client {id}:")
+        logger.info(f"  - Default prompt length: {len(default_prompt)} chars")
+        client_prompt = config.get('agent', {}).get('system_prompt', '').strip()
+        if client_prompt:
+            logger.info(f"  - Client-specific prompt length: {len(client_prompt)} chars")
+            logger.info(f"  - Client-specific prompt preview: {client_prompt[:200]}...")
+        else:
+            logger.info(f"  - No client-specific prompt found, using default only")
+        
         system_instruction = system_prompt + datetime_context + languages_context + guardrails_context
 
         # Build tools based on client config
         tools_list = []
         tools_config = agent_config.get('tools', [])
         
-        # Create function wrappers that include client_id
+        # Create function wrappers that include id
         async def fetch_detailed_info_wrapper(params: FunctionCallParams):
-            return await fetch_detailed_information(client_id, params)
+            return await fetch_detailed_information(id, params)
         
         async def check_user_exists_wrapper(params: FunctionCallParams):
-            return await check_user_exists(client_id, params)
+            return await check_user_exists(id, params)
         
         # Add tools based on config
         for tool_config in tools_config:
@@ -1341,7 +1355,7 @@ async def run_bot(id: str, room_url: str, token: str):
 
         @transport.event_handler("on_participant_left")
         async def on_participant_left(transport, participant, reason):
-            logger.info(f"Participant left: {participant}, reason: {reason} (client: {client_id})")
+            logger.info(f"Participant left: {participant}, reason: {reason} (client: {id})")
             
             try:
                 conversation_history = []
@@ -1363,31 +1377,41 @@ async def run_bot(id: str, room_url: str, token: str):
                 conversation_text = "\n".join(conversation_history)
                 
                 if conversation_text.strip():
-                    logger.info(f"Sending conversation history to postprocessor (client: {client_id})...")
+                    logger.info(f"📤 Sending conversation history to postprocessor (client: {id})...")
+                    logger.info(f"  - Conversation length: {len(conversation_text)} chars")
+                    logger.info(f"  - Number of messages: {len(conversation_history)}")
                     try:
-                        postprocessor_url = get_postprocessor_url(client_id)
+                        # Get postprocessor URL from client config
+                        postprocessor_url = get_postprocessor_url(id)
+                        logger.info(f"  - Postprocessor URL: {postprocessor_url}")
+                        
+                        # Get client_id for the postprocessor endpoint
+                        client_id = config.get('client_id')
+                        logger.info(f"  - Using client_id for postprocessor: {client_id}")
+                        
                         async with httpx.AsyncClient(timeout=30.0) as client_http:
                             response = await client_http.post(
                                 f"{postprocessor_url}/process?client_id={client_id}",
                                 json={"conversation": conversation_text}
                             )
                             if response.status_code == 200:
-                                logger.info("Conversation history sent to postprocessor successfully")
+                                logger.info("✅ Conversation history sent to postprocessor successfully")
+                                logger.info(f"  - Response: {response.json()}")
                             else:
-                                logger.warning(f"Postprocessor returned status {response.status_code}: {response.text}")
+                                logger.warning(f"⚠️ Postprocessor returned status {response.status_code}: {response.text}")
                     except Exception as e:
-                        logger.error(f"Error sending conversation history to postprocessor: {e}", exc_info=True)
+                        logger.error(f"❌ Error sending conversation history to postprocessor: {e}", exc_info=True)
                 else:
-                    logger.warning("No conversation history to send - context messages not accessible")
+                    logger.warning("⚠️ No conversation history to send - conversation is empty")
                     
             except Exception as e:
-                logger.error(f"Error processing conversation history: {e}", exc_info=True)
+                logger.error(f"❌ Error processing conversation history: {e}", exc_info=True)
             
             await task.queue_frame(EndFrame())
 
         @transport.event_handler("on_participant_joined")
         async def on_participant_joined(transport, participant):
-            logger.info(f"Participant joined: {participant} (client: {client_id})")
+            logger.info(f"Participant joined: {participant} (client: {id})")
             await transport.capture_participant_transcription(participant["id"])
 
         logger.info("Starting pipeline runner")
@@ -1396,7 +1420,7 @@ async def run_bot(id: str, room_url: str, token: str):
         
         logger.info("Pipeline runner completed")
     except Exception as e:
-        logger.error("Error running bot for client {}: {}", client_id, str(e), exc_info=True)
+        logger.error(f"Error running bot for client {id}: {str(e)}", exc_info=True)
         raise
     finally:
         if transport:
