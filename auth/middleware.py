@@ -80,21 +80,21 @@ def require_auth(
     return User(**user_info)
 
 
-def check_client_ownership(client_id: str, user: User) -> None:
+def check_client_ownership(id: str, user: User) -> None:
     """
-    Check if user owns a client. Raises HTTPException if not.
+    Check if user owns a client by MongoDB ObjectId. Raises HTTPException if not.
     
     Usage:
-        @app.put("/clients/{client_id}/system-prompt")
+        @app.put("/clients/{id}/system-prompt")
         async def update_prompt(
-            client_id: str,
+            id: str,
             user: User = Depends(require_auth)
         ):
-            check_client_ownership(client_id, user)
+            check_client_ownership(id, user)
             return {"message": "Updated"}
     
     Args:
-        client_id: The client ID to check ownership for
+        id: The MongoDB ObjectId as string
         user: Authenticated user
         
     Raises:
@@ -109,16 +109,26 @@ def check_client_ownership(client_id: str, user: User) -> None:
         )
     
     try:
+        # Convert string to ObjectId
+        try:
+            from bson.errors import InvalidId
+            object_id = ObjectId(id)
+        except (InvalidId, TypeError):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid ObjectId format: {id}"
+            )
+        
         # Get client config from MongoDB
         admin_db = mongo_client[ADMIN_DB_NAME]
         clients_collection = admin_db["client_configs"]
         
-        client_config = clients_collection.find_one({"client_id": client_id})
+        client_config = clients_collection.find_one({"_id": object_id})
         
         if not client_config:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Client '{client_id}' not found"
+                detail=f"Client with id '{id}' not found"
             )
         
         # Check if user owns this client
