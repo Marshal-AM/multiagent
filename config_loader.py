@@ -8,8 +8,19 @@ from typing import Dict, Optional
 from pathlib import Path
 from pymongo import MongoClient
 from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
+from bson import ObjectId
+from bson.errors import InvalidId
 import logging
 
+# Load environment variables from .env file if available
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # dotenv not available, use environment variables directly
+
+# Configure logger
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # MongoDB connection for config storage
@@ -22,7 +33,7 @@ _mongo_client = None
 
 
 def get_mongodb_client():
-    """Get MongoDB client for config storage"""
+    """Get MongoDB client for config storage with connection pooling"""
     global _mongo_client
     if _mongo_client is not None:
         return _mongo_client
@@ -32,8 +43,19 @@ def get_mongodb_client():
         return None
     
     try:
-        _mongo_client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
+        _mongo_client = MongoClient(
+            MONGODB_URI,
+            maxPoolSize=50,  # Maximum 50 connections in pool
+            minPoolSize=10,  # Minimum 10 connections always ready
+            maxIdleTimeMS=45000,  # Close idle connections after 45s
+            serverSelectionTimeoutMS=5000,  # Timeout for server selection
+            connectTimeoutMS=10000,  # Timeout for initial connection
+            socketTimeoutMS=45000,  # Timeout for socket operations
+            retryWrites=True,  # Retry writes on network errors
+            retryReads=True,  # Retry reads on network errors
+        )
         _mongo_client.admin.command('ping')
+        logger.info("✅ MongoDB connection pool initialized for config_loader")
         return _mongo_client
     except (ConnectionFailure, ServerSelectionTimeoutError) as e:
         logger.error(f"Failed to connect to MongoDB: {e}")
@@ -43,43 +65,55 @@ def get_mongodb_client():
         return None
 
 
-def load_client_config(client_id: str) -> dict:
+def load_client_config(id: str) -> dict:
     """
-    Load client configuration from MongoDB.
+    Load client configuration from MongoDB by ObjectId.
     
     Args:
-        client_id: Unique client identifier
+        id: MongoDB ObjectId as string
         
     Returns:
         Client configuration dictionary
         
     Raises:
         FileNotFoundError: If client config doesn't exist in MongoDB
-        ValueError: If config is invalid
+        ValueError: If config is invalid or ObjectId format is invalid
     """
-    # Normalize client_id
-    client_id = client_id.lower().strip()
-    
     # Check cache first
-    if client_id in _config_cache:
-        return _config_cache[client_id]
+    if id in _config_cache:
+        return _config_cache[id]
     
     # Load from MongoDB
     mongo_client = get_mongodb_client()
     if not mongo_client:
-        raise FileNotFoundError(f"MongoDB connection failed. Cannot load config for client: {client_id}")
+        raise FileNotFoundError(f"MongoDB connection failed. Cannot load config for client: {id}")
     
     try:
+        # Convert string to ObjectId
+        try:
+            object_id = ObjectId(id)
+        except (InvalidId, TypeError) as e:
+            logger.error(f"Invalid ObjectId format: {id}")
+            raise ValueError(f"Invalid ObjectId format: {id}")
+        
         admin_db = mongo_client[ADMIN_DB_NAME]
         clients_collection = admin_db["client_configs"]
         
-        config = clients_collection.find_one({"client_id": client_id})
+        logger.info(f"Looking for client with _id: '{id}' in database '{ADMIN_DB_NAME}', collection 'client_configs'")
+        
+        # Find by ObjectId
+        config = clients_collection.find_one({"_id": object_id})
         
         if not config:
-            raise FileNotFoundError(f"Client config not found in MongoDB: {client_id}")
+            # Try to list what's actually in the DB for debugging
+            all_clients = list(clients_collection.find({}, {"_id": 1, "client_id": 1}))
+            client_ids_in_db = [{"_id": str(c.get("_id")), "client_id": c.get("client_id")} for c in all_clients]
+            logger.error(f"Client with id '{id}' not found in database '{ADMIN_DB_NAME}'. Available clients: {client_ids_in_db}")
+            raise FileNotFoundError(f"Client config not found in MongoDB: {id}")
         
-        # Remove MongoDB _id
-        config.pop('_id', None)
+        # Convert ObjectId to string for JSON serialization
+        if '_id' in config:
+            config['_id'] = str(config['_id'])
         
         # Validate required fields
         required_fields = ['client_id', 'client_name']
@@ -87,60 +121,62 @@ def load_client_config(client_id: str) -> dict:
             if field not in config:
                 raise ValueError(f"Missing required field '{field}' in client config")
         
-        # Ensure client_id matches
-        if config['client_id'] != client_id:
-            raise ValueError(f"Client ID mismatch: expected {client_id}, got {config['client_id']}")
-        
-        # Cache the config
-        _config_cache[client_id] = config
+        # Cache the config using the ObjectId string
+        _config_cache[id] = config
+        logger.info(f"✅ Successfully loaded config for client: {id} (client_id: {config.get('client_id')})")
         
         return config
         
     except FileNotFoundError:
         raise
+    except ValueError:
+        raise
     except Exception as e:
-        raise ValueError(f"Error loading client config from MongoDB: {e}")
+        logger.error(f"Error loading client config from MongoDB: {e}")
+        raise FileNotFoundError(f"Failed to load client config: {str(e)}")
 
 
-def get_client_config(client_id: str) -> dict:
+def get_client_config(id: str) -> dict:
     """
-    Get client configuration (cached).
-    
+    Get client configuration by ObjectId (cached).
+
     Args:
-        client_id: Unique client identifier
-        
+        id: MongoDB ObjectId as string
+
     Returns:
         Client configuration dictionary
     """
-    return load_client_config(client_id)
+    return load_client_config(id)
 
 
-def get_mongodb_database_name(client_id: str) -> str:
+def get_mongodb_database_name(id: str) -> str:
     """
-    Get MongoDB database name for a client.
+    Get MongoDB database name for a client by ObjectId.
     Uses client-specific database name from config, or defaults to client_id.
-    
+
     Args:
-        client_id: Unique client identifier
-        
+        id: MongoDB ObjectId as string
+
     Returns:
         MongoDB database name
     """
-    config = get_client_config(client_id)
+    config = get_client_config(id)
+    client_id = config.get('client_id', id)
     return config.get('mongodb', {}).get('database_name', client_id.upper())
 
 
-def get_s3_bucket_name(client_id: str) -> str:
+def get_s3_bucket_name(id: str) -> str:
     """
-    Get S3 bucket name for a client.
-    
+    Get S3 bucket name for a client by ObjectId.
+
     Args:
-        client_id: Unique client identifier
-        
+        id: MongoDB ObjectId as string
+
     Returns:
         S3 bucket name
     """
-    config = get_client_config(client_id)
+    config = get_client_config(id)
+    client_id = config.get('client_id', id)
     return config.get('s3', {}).get('bucket_name', f"{client_id}-storage")
 
 
@@ -265,4 +301,3 @@ def get_client_id_from_request(request) -> str:
         )
     
     return client_id
-
