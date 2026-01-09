@@ -1195,18 +1195,22 @@ async def run_bot(id: str, room_url: str, token: str):
         
         guardrails_context = format_guardrails_for_prompt(id)
         
-        # Load client-specific system prompt
+        # Load client-specific system prompt from DB
         system_prompt = load_system_prompt(id)
+        
+        # Log what we loaded
         logger.info(f"📝 System Prompt Loaded for client {id}:")
-        logger.info(f"  - Default prompt length: {len(default_prompt)} chars")
-        client_prompt = config.get('agent', {}).get('system_prompt', '').strip()
-        if client_prompt:
-            logger.info(f"  - Client-specific prompt length: {len(client_prompt)} chars")
-            logger.info(f"  - Client-specific prompt preview: {client_prompt[:200]}...")
+        client_prompt_from_db = config.get('agent', {}).get('system_prompt', '').strip()
+        if client_prompt_from_db:
+            logger.info(f"  ✅ Client-specific prompt FROM DB: '{client_prompt_from_db}'")
+            logger.info(f"  - Length: {len(client_prompt_from_db)} chars")
         else:
-            logger.info(f"  - No client-specific prompt found, using default only")
+            logger.info(f"  ℹ️ No client-specific prompt in DB, using default only")
+        logger.info(f"  - Total system instruction length: {len(system_prompt)} chars")
         
         system_instruction = system_prompt + datetime_context + languages_context + guardrails_context
+        
+        logger.info(f"📋 Final system instruction length: {len(system_instruction)} chars")
 
         # Build tools based on client config
         tools_list = []
