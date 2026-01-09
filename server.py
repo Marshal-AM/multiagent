@@ -1329,7 +1329,7 @@ async def run_bot(id: str, room_url: str, token: str):
         context = LLMContext([
             {
                 "role": "assistant",
-                "content": "Greet the person warmly and introduce yourself. Then ask for their name. Once you have their name, ask for their mobile number (10 digits) OR email address - at least one of them is required. If they provide a phone number, confirm it by reciting the 10 digits back to them. You can ask for both, but at least one contact method is mandatory. Once you have their name and at least one contact method (phone or email), you can proceed with the counseling session. Be friendly, warm, and approachable. Keep each question brief and wait for their response before moving to the next question."
+                "content": "Greet the person warmly and introduce yourself. Then ask for their name. Once you have their name, ask for their mobile number (10 digits) OR email address - at least one of them is required. If they provide a phone number, confirm it by reciting the 10 digits back to them. You can ask for both, but at least one contact method is mandatory. Once you have their name and at least one contact method (phone or email), you can proceed with the session. Be friendly, warm, and approachable. Keep each question brief and wait for their response before moving to the next question."
             }
         ])
 
