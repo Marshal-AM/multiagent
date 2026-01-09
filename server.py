@@ -618,10 +618,10 @@ def get_current_datetime_info():
 def load_system_prompt(id: str) -> str:
     """
     Load system prompt from MongoDB for a specific client.
-    Always includes the default system prompt from system_prompt.py along with client-specific prompt.
+    Client-specific prompt comes FIRST (as primary identity), then general guidelines.
     Now uses MongoDB ObjectId instead of client_id string.
     """
-    # Always load the default system prompt first
+    # Load the default system prompt (general guidelines)
     from system_prompt import SYSTEM_PROMPT
     default_prompt = SYSTEM_PROMPT.strip()
 
@@ -630,12 +630,20 @@ def load_system_prompt(id: str) -> str:
         client_system_prompt = config.get('agent', {}).get('system_prompt', '').strip()
 
         if client_system_prompt:
-            # Combine default prompt with client-specific prompt
-            # Default prompt comes first, then client-specific prompt
-            combined_prompt = f"{default_prompt}\n\n## CLIENT-SPECIFIC INSTRUCTIONS\n\n{client_system_prompt}"
+            # Client-specific prompt comes FIRST as the primary identity
+            # Default prompt comes SECOND as general operational guidelines
+            combined_prompt = f"""# 🎯 YOUR PRIMARY IDENTITY AND ROLE (MOST IMPORTANT)
+
+{client_system_prompt}
+
+---
+
+# 📋 GENERAL OPERATIONAL GUIDELINES
+
+{default_prompt}"""
             logger.info(f"✅ Loaded combined system prompt for client {id}")
-            logger.info(f"  - Default prompt: {len(default_prompt)} chars")
-            logger.info(f"  - Client prompt: {len(client_system_prompt)} chars")
+            logger.info(f"  - Client-specific identity: {len(client_system_prompt)} chars (PRIMARY)")
+            logger.info(f"  - General guidelines: {len(default_prompt)} chars (SECONDARY)")
             return combined_prompt
         else:
             # No client-specific prompt, use only default
